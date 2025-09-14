@@ -125,15 +125,27 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build & push (Linux)
+      - name: Build & push
+        id: build
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
-          echo ">>> Building .#$pkg (Linux)"
-          nix build ".#$pkg"
-          out="$(nix path-info ".#$pkg")"
-          echo "out=$out" >> "$GITHUB_OUTPUT"
-          cachix push dmlane "$out"
+          echo ">>> Building .#$pkg"
+      
+          # Build and capture *all* outputs (out, man, dev, etc.) as a JSON array
+          outs=$(nix build --no-link --json ".#$pkg" \
+            | jq -r '[.[].outputs | to_entries[] | .value]')
+      
+          # Export the JSON array to GITHUB_OUTPUT (multi-line safe)
+          echo "outs<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$outs" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+      
+          # Push every path in the JSON array to Cachix
+          echo "$outs" | jq -r '.[]' | while read -r p; do
+            echo ">>> Pushing $p to Cachix"
+            cachix push dmlane "$p"
+          done
 
       - name: Pin build (keep last 5 versions)
         run: |
