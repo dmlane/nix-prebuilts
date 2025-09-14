@@ -36,7 +36,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Decide diff base (previous commit for push; handles first push too)
+          # Determine base commit to diff against
           if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && \
                 "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
             base="${{ github.event.before }}"
@@ -58,22 +58,18 @@ jobs:
             full_rebuild=true
           fi
 
-          # Map pkgs/** paths -> package names
+          # Map changed pkgs/** paths to package names
           mapfile -t changed_pkgs < <(
             awk 'NF' <(printf '%s\n' "${files}") | while read -r f; do
               case "$f" in
-                pkgs/*.nix)
-                  basename "${f%.nix}"
-                  ;;
-                pkgs/*/*.nix)
-                  basename "$(dirname "$f")"
-                  ;;
+                pkgs/*.nix) basename "${f%.nix}" ;;
+                pkgs/*/*.nix) basename "$(dirname "$f")" ;;
               esac
             done | awk 'NF && !seen[$0]++'
           )
 
-          mapfile -t all_linux   < <(nix eval --json .#packages.x86_64-linux   | jq -r 'keys[]' | grep -v '^default$' || true)
-          mapfile -t all_darwin  < <(nix eval --json .#packages.aarch64-darwin | jq -r 'keys[]' | grep -v '^default$' || true)
+          mapfile -t all_linux  < <(nix eval --json .#packages.x86_64-linux   | jq -r 'keys[]' | grep -v '^default$' || true)
+          mapfile -t all_darwin < <(nix eval --json .#packages.aarch64-darwin | jq -r 'keys[]' | grep -v '^default$' || true)
 
           to_json_array() { jq -R . | jq -s .; }
 
@@ -81,11 +77,11 @@ jobs:
             printf '%s\n' "${all_linux[@]}"  | to_json_array | tee /tmp/linux.json
             printf '%s\n' "${all_darwin[@]}" | to_json_array | tee /tmp/darwin.json
           else
-            printf '%s\n' "${changed_pkgs[@]}" | awk 'NF' | while read -r p; do
+            printf '%s\n' "${changed_pkgs[@]}" | while read -r p; do
               if printf '%s\n' "${all_linux[@]}" | grep -qx "$p"; then echo "$p"; fi
             done | to_json_array | tee /tmp/linux.json
 
-            printf '%s\n' "${changed_pkgs[@]}" | awk 'NF' | while read -r p; do
+            printf '%s\n' "${changed_pkgs[@]}" | while read -r p; do
               if printf '%s\n' "${all_darwin[@]}" | grep -qx "$p"; then echo "$p"; fi
             done | to_json_array | tee /tmp/darwin.json
 
@@ -140,17 +136,17 @@ jobs:
       - name: Push to Cachix
         run: |
           set -euo pipefail
-          cachix push dmlane "$(nix path-info .#${{ matrix.package }})"
+          cachix push dmlane $(nix path-info .#${{ matrix.package }})
 
       - name: Pin build (keep last 5 versions)
         run: |
           set -euo pipefail
-          store_path="$(nix path-info .#${{ matrix.package }})"
+          store_path="$(nix path-info .#${{ matrix.package }} | head -n1)"
           .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$store_path"
 
       - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
-        run: "$(nix path-info .#${{ matrix.package }})/bin/ffmpeg -hide_banner -filters | grep -i vmaf"
+        run: "$(nix path-info .#${{ matrix.package }} | head -n1)/bin/ffmpeg -hide_banner -filters | grep -i vmaf"
 
   build-darwin:
     needs: plan
@@ -184,15 +180,15 @@ jobs:
       - name: Push to Cachix
         run: |
           set -euo pipefail
-          cachix push dmlane "$(nix path-info .#${{ matrix.package }})"
+          cachix push dmlane $(nix path-info .#${{ matrix.package }})
 
       - name: Pin build (keep last 5 versions)
         run: |
           set -euo pipefail
-          store_path="$(nix path-info .#${{ matrix.package }})"
+          store_path="$(nix path-info .#${{ matrix.package }} | head -n1)"
           .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$store_path"
 
       - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
-        run: "$(nix path-info .#${{ matrix.package }})/bin/ffmpeg -hide_banner -filters | grep -i vmaf"
+        run: "$(nix path-info .#${{ matrix.package }} | head -n1)/bin/ffmpeg -hide_banner -filters | grep -i vmaf"
 
