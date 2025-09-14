@@ -142,7 +142,7 @@ jobs:
       - name: Pin build (keep last 5 versions)
         run: |
           set -euo pipefail
-          ./github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$(readlink -f result)"
+          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$(readlink -f result)"
 
       - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
@@ -181,7 +181,7 @@ jobs:
       - name: Pin build (keep last 5 versions)
         run: |
           set -euo pipefail
-          ./github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$(readlink -f result)"
+          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$(readlink -f result)"
 
 
       - name: Verify VMAF for ffmpeg
