@@ -36,7 +36,8 @@ jobs:
           set -euo pipefail
 
           # Decide diff base (previous commit or empty for first push)
-          if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+          if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && \
+                "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
             base="${{ github.event.before }}"
           else
             base="$(git rev-parse HEAD^ || true)"
@@ -125,20 +126,18 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build, push & pin (Linux)
+      - name: Build & push (Linux)
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
           echo ">>> Building .#$pkg (Linux)"
 
-          # Build and pin each output (out, bin, lib, man, etc.)
+          # Build and push every output (out, bin, lib, man, etc.) to Cachix
           nix build --no-link --json ".#$pkg" |
-            jq -r '.[].outputs | to_entries[] | "\(.key)=\(.value)"' |
-          while IFS='=' read -r name path; do
-            pin_name="${pkg}-linux-${name}"
-            echo ">>> Pushing & pinning $pin_name -> $path"
+            jq -r '.[].outputs | to_entries[] | .value' |
+          while read -r path; do
+            echo ">>> Pushing $path to Cachix"
             cachix push dmlane "$path"
-            cachix pin dmlane "$pin_name" "$path" --keep-revisions 5
           done
 
   build-darwin:
@@ -166,18 +165,17 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build, push & pin (Darwin)
+      - name: Build & push (Darwin)
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
           echo ">>> Building .#$pkg (Darwin)"
 
+          # Build and push every output to Cachix
           nix build --no-link --json ".#$pkg" |
-            jq -r '.[].outputs | to_entries[] | "\(.key)=\(.value)"' |
-          while IFS='=' read -r name path; do
-            pin_name="${pkg}-darwin-${name}"
-            echo ">>> Pushing & pinning $pin_name -> $path"
+            jq -r '.[].outputs | to_entries[] | .value' |
+          while read -r path; do
+            echo ">>> Pushing $path to Cachix"
             cachix push dmlane "$path"
-            cachix pin dmlane "$pin_name" "$path" --keep-revisions 5
           done
 
