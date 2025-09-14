@@ -1,54 +1,194 @@
-#!/usr/bin/env bash
-# pin_keep5.sh
-#
-# Pin a Nix build result to a Cachix cache and keep only the 5 newest pins.
+name: build-cache
 
-set -euo pipefail
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'pkgs/**'
+      - 'flake.nix'
+      - 'flake.lock'
+  workflow_dispatch:
 
-CACHE_NAME="$1"
-PACKAGE_NAME="$2"
-STORE_PATH="$3"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
-# Resolve symlink to absolute store path
-if [ -L "$STORE_PATH" ]; then
-    if command -v realpath >/dev/null 2>&1; then
-        STORE_PATH="$(realpath "$STORE_PATH")"
-    else
-        STORE_PATH="$(cd "$(dirname "$STORE_PATH")" && pwd)/$(basename "$STORE_PATH")"
-    fi
-fi
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      packages_linux: ${{ steps.plan.outputs.packages_linux }}
+      packages_darwin: ${{ steps.plan.outputs.packages_darwin }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-if [ ! -e "$STORE_PATH" ]; then
-    echo "Error: store path '$STORE_PATH' does not exist."
-    exit 1
-fi
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
-TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-PIN_NAME="${PACKAGE_NAME}-${TIMESTAMP}"
+      - name: Compute changed files & package matrix
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
 
-echo ">>> Pinning $STORE_PATH as $PIN_NAME in cache $CACHE_NAME"
-cachix pin "$CACHE_NAME" "$PIN_NAME" "$STORE_PATH"
+          # Determine base commit to diff against
+          if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && \
+                "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            base="${{ github.event.before }}"
+          else
+            base="$(git rev-parse HEAD^ || true)"
+          fi
 
-echo ">>> Trimming to keep only the newest 5 pins for $PACKAGE_NAME"
-# Ensure we correctly extract the first whitespace-delimited field even with tabs
-ALL_PINS=$(cachix pin list "$CACHE_NAME" \
-  | grep "^${PACKAGE_NAME}-" \
-  | awk '{print $1}' \
-  | sort || true)
+          files=""
+          if [[ -n "${base}" ]]; then
+            files="$(git diff --name-only "$base"...HEAD -- \
+              'pkgs/**' 'flake.nix' 'flake.lock' '.github/workflows/build.yml' || true)"
+          fi
 
-# Determine pins to keep
-KEEP=$(echo "$ALL_PINS" | tail -n 5)
+          echo "Changed files:"
+          printf '%s\n' "${files}"
 
-if [ -n "$ALL_PINS" ]; then
-  for p in $ALL_PINS; do
-    if ! echo "$KEEP" | grep -qx "$p"; then
-      echo "Unpinning old pin $p"
-      cachix unpin "$CACHE_NAME" "$p"
-    fi
-  done
-fi
+          full_rebuild=false
+          if [[ -z "${base}" ]] || echo "${files}" | grep -qE '(^|/)(flake\.nix|flake\.lock)'; then
+            full_rebuild=true
+          fi
 
-echo ">>> Remaining pins for $PACKAGE_NAME:"
-cachix pin list "$CACHE_NAME" | grep "^${PACKAGE_NAME}-" || true
-echo ">>> Done."
+          # Map changed pkgs/** paths to package names
+          mapfile -t changed_pkgs < <(
+            awk 'NF' <(printf '%s\n' "${files}") | while read -r f; do
+              case "$f" in
+                pkgs/*.nix) basename "${f%.nix}" ;;
+                pkgs/*/*.nix) basename "$(dirname "$f")" ;;
+              esac
+            done | awk 'NF && !seen[$0]++'
+          )
+
+          mapfile -t all_linux  < <(nix eval --json .#packages.x86_64-linux   | jq -r 'keys[]' | grep -v '^default$' || true)
+          mapfile -t all_darwin < <(nix eval --json .#packages.aarch64-darwin | jq -r 'keys[]' | grep -v '^default$' || true)
+
+          to_json_array() { jq -R . | jq -s .; }
+
+          if $full_rebuild; then
+            printf '%s\n' "${all_linux[@]}"  | to_json_array | tee /tmp/linux.json
+            printf '%s\n' "${all_darwin[@]}" | to_json_array | tee /tmp/darwin.json
+          else
+            printf '%s\n' "${changed_pkgs[@]}" | while read -r p; do
+              if printf '%s\n' "${all_linux[@]}" | grep -qx "$p"; then echo "$p"; fi
+            done | to_json_array | tee /tmp/linux.json
+
+            printf '%s\n' "${changed_pkgs[@]}" | while read -r p; do
+              if printf '%s\n' "${all_darwin[@]}" | grep -qx "$p"; then echo "$p"; fi
+            done | to_json_array | tee /tmp/darwin.json
+
+            if [[ "$(jq 'length' /tmp/linux.json)" == "0" && \
+                  "$(jq 'length' /tmp/darwin.json)" == "0" ]]; then
+              printf '%s\n' "${all_linux[@]}"  | to_json_array > /tmp/linux.json
+              printf '%s\n' "${all_darwin[@]}" | to_json_array > /tmp/darwin.json
+            fi
+          fi
+
+          {
+            echo "packages_linux<<EOF"
+            cat /tmp/linux.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "packages_darwin<<EOF"
+            cat /tmp/darwin.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: plan
+    if: ${{ needs.plan.outputs.packages_linux != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+        package: ${{ fromJson(needs.plan.outputs.packages_linux) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: dmlane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          nix build -L ".#${{ matrix.package }}"
+
+      - name: Push to Cachix
+        run: |
+          set -euo pipefail
+          cachix push dmlane $(nix path-info .#${{ matrix.package }})
+
+      - name: Pin build (keep last 5 versions)
+        run: |
+          set -euo pipefail
+          store_path="$(nix path-info .#${{ matrix.package }} | head -n1)"
+          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$store_path"
+
+      - name: Verify VMAF for ffmpeg
+        if: matrix.package == 'ffmpeg-with-vmaf'
+        run: "$(nix path-info .#${{ matrix.package }} | head -n1)/bin/ffmpeg -hide_banner -filters | grep -i vmaf"
+
+  build-darwin:
+    needs: plan
+    if: ${{ needs.plan.outputs.packages_darwin != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+        package: ${{ fromJson(needs.plan.outputs.packages_darwin) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: dmlane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          nix build -L ".#${{ matrix.package }}"
+
+      - name: Push to Cachix
+        run: |
+          set -euo pipefail
+          cachix push dmlane $(nix path-info .#${{ matrix.package }})
+
+      - name: Pin build (keep last 5 versions)
+        run: |
+          set -euo pipefail
+          store_path="$(nix path-info .#${{ matrix.package }} | head -n1)"
+          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$store_path"
+
+      - name: Verify VMAF for ffmpeg
+        if: matrix.package == 'ffmpeg-with-vmaf'
+        run: "$(nix path-info .#${{ matrix.package }} | head -n1)/bin/ffmpeg -hide_banner -filters | grep -i vmaf"
 
