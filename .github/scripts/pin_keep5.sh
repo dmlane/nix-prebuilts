@@ -46,7 +46,7 @@ KEEP=$(echo "$ALL_PINS" | tail -n 5)
 for p in $ALL_PINS; do
     if ! echo "$KEEP" | grep -qx "$p"; then
         echo "Unpinning old pin $p"
-        cachix pin remove "$CACHE_NAME" "$p"
+        cachix unpin "$CACHE_NAME" "$p"
     fi
 done
 
