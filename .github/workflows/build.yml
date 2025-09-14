@@ -58,6 +58,7 @@ jobs:
             full_rebuild=true
           fi
 
+          # Map pkgs/** paths -> package names
           mapfile -t changed_pkgs < <(
             awk 'NF' <(printf '%s\n' "${files}") | while read -r f; do
               case "$f" in
@@ -81,7 +82,7 @@ jobs:
             printf '%s\n' "${all_darwin[@]}" | to_json_array | tee /tmp/darwin.json
           else
             printf '%s\n' "${changed_pkgs[@]}" | awk 'NF' | while read -r p; do
-              if printf '%s\n' "${all_linux[@]}"  | grep -qx "$p"; then echo "$p"; fi
+              if printf '%s\n' "${all_linux[@]}" | grep -qx "$p"; then echo "$p"; fi
             done | to_json_array | tee /tmp/linux.json
 
             printf '%s\n' "${changed_pkgs[@]}" | awk 'NF' | while read -r p; do
@@ -134,21 +135,22 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
-          nix build -L ".#${{ matrix.package }}" --out-link ./result
+          nix build -L ".#${{ matrix.package }}"
 
       - name: Push to Cachix
         run: |
           set -euo pipefail
-          cachix push dmlane ./result
+          cachix push dmlane "$(nix path-info .#${{ matrix.package }})"
 
       - name: Pin build (keep last 5 versions)
         run: |
           set -euo pipefail
-          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" ./result
+          store_path="$(nix path-info .#${{ matrix.package }})"
+          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$store_path"
 
       - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
-        run: ./result/bin/ffmpeg -hide_banner -filters | grep -i vmaf
+        run: "$(nix path-info .#${{ matrix.package }})/bin/ffmpeg -hide_banner -filters | grep -i vmaf"
 
   build-darwin:
     needs: plan
@@ -177,19 +179,20 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
-          nix build -L ".#${{ matrix.package }}" --out-link ./result
+          nix build -L ".#${{ matrix.package }}"
 
       - name: Push to Cachix
         run: |
           set -euo pipefail
-          cachix push dmlane ./result
+          cachix push dmlane "$(nix path-info .#${{ matrix.package }})"
 
       - name: Pin build (keep last 5 versions)
         run: |
           set -euo pipefail
-          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" ./result
+          store_path="$(nix path-info .#${{ matrix.package }})"
+          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$store_path"
 
       - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
-        run: ./result/bin/ffmpeg -hide_banner -filters | grep -i vmaf
+        run: "$(nix path-info .#${{ matrix.package }})/bin/ffmpeg -hide_banner -filters | grep -i vmaf"
 
