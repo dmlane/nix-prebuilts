@@ -130,6 +130,11 @@ jobs:
           echo ">>> Building .#${{ matrix.package }} on Linux"
           cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}"
 
+      - name: Pin build (keep last 5 versions)
+        run: |
+          set -euo pipefail
+          ./github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$(readlink -f result)"
+
       - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
         run: ./result/bin/ffmpeg -hide_banner -filters | grep -i vmaf
@@ -163,6 +168,12 @@ jobs:
           set -euo pipefail
           echo ">>> Building .#${{ matrix.package }} on macOS"
           cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}"
+
+      - name: Pin build (keep last 5 versions)
+        run: |
+          set -euo pipefail
+          ./github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$(readlink -f result)"
+
 
       - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
