@@ -15,12 +15,12 @@ CACHE_NAME="$1"
 PACKAGE_NAME="$2"
 STORE_PATH="$3"
 
-# Ensure store path is resolved if it's a symlink (works on Linux & macOS)
+# Resolve symlink to absolute store path (works on macOS & Linux)
 if [ -L "$STORE_PATH" ]; then
     if command -v realpath > /dev/null 2>&1; then
         STORE_PATH="$(realpath "$STORE_PATH")"
     else
-        # Fallback for systems without realpath (e.g., older macOS)
+        # Fallback if realpath isn't available
         STORE_PATH="$(cd "$(dirname "$STORE_PATH")" && pwd)/$(basename "$STORE_PATH")"
     fi
 fi
@@ -30,7 +30,6 @@ if [ ! -e "$STORE_PATH" ]; then
     exit 1
 fi
 
-# Unique pin name based on package and UTC timestamp
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 PIN_NAME="${PACKAGE_NAME}-${TIMESTAMP}"
 
@@ -38,12 +37,10 @@ echo ">>> Pinning $STORE_PATH as $PIN_NAME in cache $CACHE_NAME"
 cachix pin "$CACHE_NAME" "$PIN_NAME" "$STORE_PATH"
 
 echo ">>> Trimming to keep only the newest 5 pins for $PACKAGE_NAME"
-# List all pins for this package, sort by name (timestamps ensure lexicographic order)
 ALL_PINS=$(cachix pin list "$CACHE_NAME" |
     awk -v pkg="$PACKAGE_NAME" '$1 ~ "^"pkg"-" {print $1}' |
     sort)
 
-# Keep only the 5 most recent pins
 KEEP=$(echo "$ALL_PINS" | tail -n 5)
 
 for p in $ALL_PINS; do
@@ -55,5 +52,4 @@ done
 
 echo ">>> Remaining pins for $PACKAGE_NAME:"
 cachix pin list "$CACHE_NAME" | grep "^${PACKAGE_NAME}-" || true
-
 echo ">>> Done."

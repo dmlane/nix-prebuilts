@@ -58,7 +58,6 @@ jobs:
             full_rebuild=true
           fi
 
-          # Map pkgs/** paths -> package names (dir name or file stem)
           mapfile -t changed_pkgs < <(
             awk 'NF' <(printf '%s\n' "${files}") | while read -r f; do
               case "$f" in
@@ -72,9 +71,8 @@ jobs:
             done | awk 'NF && !seen[$0]++'
           )
 
-          # All package names per system (used for verification and full rebuild)
-          mapfile -t all_linux   < <(nix eval --json .#packages.x86_64-linux    | jq -r 'keys[]' | grep -v '^default$' || true)
-          mapfile -t all_darwin  < <(nix eval --json .#packages.aarch64-darwin  | jq -r 'keys[]' | grep -v '^default$' || true)
+          mapfile -t all_linux   < <(nix eval --json .#packages.x86_64-linux   | jq -r 'keys[]' | grep -v '^default$' || true)
+          mapfile -t all_darwin  < <(nix eval --json .#packages.aarch64-darwin | jq -r 'keys[]' | grep -v '^default$' || true)
 
           to_json_array() { jq -R . | jq -s .; }
 
@@ -82,7 +80,6 @@ jobs:
             printf '%s\n' "${all_linux[@]}"  | to_json_array | tee /tmp/linux.json
             printf '%s\n' "${all_darwin[@]}" | to_json_array | tee /tmp/darwin.json
           else
-            # Verify changed pkgs exist per system
             printf '%s\n' "${changed_pkgs[@]}" | awk 'NF' | while read -r p; do
               if printf '%s\n' "${all_linux[@]}"  | grep -qx "$p"; then echo "$p"; fi
             done | to_json_array | tee /tmp/linux.json
@@ -91,14 +88,13 @@ jobs:
               if printf '%s\n' "${all_darwin[@]}" | grep -qx "$p"; then echo "$p"; fi
             done | to_json_array | tee /tmp/darwin.json
 
-            # If neither side has anything (e.g. new attr name mismatch), fall back to full rebuild
-            if [[ "$(jq 'length' /tmp/linux.json)" == "0" && "$(jq 'length' /tmp/darwin.json)" == "0" ]]; then
+            if [[ "$(jq 'length' /tmp/linux.json)" == "0" && \
+                  "$(jq 'length' /tmp/darwin.json)" == "0" ]]; then
               printf '%s\n' "${all_linux[@]}"  | to_json_array > /tmp/linux.json
               printf '%s\n' "${all_darwin[@]}" | to_json_array > /tmp/darwin.json
             fi
           fi
 
-          # Output multi-line JSON arrays safely for GitHub Actions
           {
             echo "packages_linux<<EOF"
             cat /tmp/linux.json
@@ -135,11 +131,15 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build & push (Linux)
+      - name: Build
         run: |
           set -euo pipefail
-          echo ">>> Building .#${{ matrix.package }} on Linux"
-          cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}" --out-link ./result
+          nix build -L ".#${{ matrix.package }}" --out-link ./result
+
+      - name: Push to Cachix
+        run: |
+          set -euo pipefail
+          cachix push dmlane ./result
 
       - name: Pin build (keep last 5 versions)
         run: |
@@ -174,11 +174,15 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build & push (Darwin)
+      - name: Build
         run: |
           set -euo pipefail
-          echo ">>> Building .#${{ matrix.package }} on macOS"
-          cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}" --out-link ./result
+          nix build -L ".#${{ matrix.package }}" --out-link ./result
+
+      - name: Push to Cachix
+        run: |
+          set -euo pipefail
+          cachix push dmlane ./result
 
       - name: Pin build (keep last 5 versions)
         run: |
