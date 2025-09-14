@@ -2,7 +2,6 @@ name: "Build & Cache all pkgs"
 
 on:
   push:
-    #
     branches: [ main ]
     paths:
       - 'pkgs/**'
@@ -79,27 +78,57 @@ jobs:
           cat darwin.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-  build:
+  build-linux:
     needs: plan
-    runs-on: ${{ matrix.os }}
-    if: ${{ needs.plan.outputs.packages_linux != '[]' || needs.plan.outputs.packages_darwin != '[]' }}
+    if: ${{ needs.plan.outputs.packages_linux != '[]' }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        package: ${{ fromJson(matrix.os == 'ubuntu-latest' && needs.plan.outputs.packages_linux || needs.plan.outputs.packages_darwin) }}
+        package: ${{ fromJson(needs.plan.outputs.packages_linux) }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix (Linux)
-        if: runner.os == 'Linux'
+      - name: Install Nix
         uses: cachix/install-nix-action@v30
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Install Nix (macOS)
-        if: runner.os == 'macOS'
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: dmlane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build & push (Linux)
+        id: buildpkg
+        run: |
+          set -euo pipefail
+          pkg="${{ matrix.package }}"
+          echo ">>> Building .#$pkg (Linux)"
+          out=$(nix build --no-link --json ".#$pkg" | jq -r '.[].outputs.out')
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+          cachix push dmlane "$out"
+
+      - name: Pin latest build (keep 5)
+        run: |
+          pkg="${{ matrix.package }}"
+          pin_name="${pkg}-linux"
+          cachix pin dmlane "$pin_name" "${{ steps.buildpkg.outputs.out }}" --keep-revisions 5
+
+  build-darwin:
+    needs: plan
+    if: ${{ needs.plan.outputs.packages_darwin != '[]' }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJson(needs.plan.outputs.packages_darwin) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v14
         with:
           extra-conf: |
@@ -111,12 +140,12 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build & push package
+      - name: Build & push (Darwin)
         id: buildpkg
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
-          echo ">>> Building .#$pkg on ${{ matrix.os }}"
+          echo ">>> Building .#$pkg (Darwin)"
           out=$(nix build --no-link --json ".#$pkg" | jq -r '.[].outputs.out')
           echo "out=$out" >> "$GITHUB_OUTPUT"
           cachix push dmlane "$out"
@@ -124,8 +153,6 @@ jobs:
       - name: Pin latest build (keep 5)
         run: |
           pkg="${{ matrix.package }}"
-          os="${{ matrix.os }}"
-          arch_suffix=$([[ "$os" == ubuntu-* ]] && echo linux || echo darwin)
-          pin_name="${pkg}-${arch_suffix}"
+          pin_name="${pkg}-darwin"
           cachix pin dmlane "$pin_name" "${{ steps.buildpkg.outputs.out }}" --keep-revisions 5
 
