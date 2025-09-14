@@ -35,9 +35,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Determine base commit (if not first push)
-          if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && \
-                "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+          # Decide diff base (previous commit or empty for first push)
+          if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
             base="${{ github.event.before }}"
           else
             base="$(git rev-parse HEAD^ || true)"
@@ -56,6 +55,7 @@ jobs:
             full_rebuild=true
           fi
 
+          # Map pkgs/** paths -> package names (dir name or file stem)
           mapfile -t changed_pkgs < <(
             awk 'NF' <(printf '%s\n' "${files}") | while read -r f; do
               case "$f" in
@@ -65,6 +65,7 @@ jobs:
             done | awk 'NF && !seen[$0]++'
           )
 
+          # All package names for each platform
           mapfile -t all_linux  < <(nix eval --json .#packages.x86_64-linux   | jq -r 'keys[]' | grep -v '^default$' || true)
           mapfile -t all_darwin < <(nix eval --json .#packages.aarch64-darwin | jq -r 'keys[]' | grep -v '^default$' || true)
 
@@ -82,6 +83,7 @@ jobs:
               if printf '%s\n' "${all_darwin[@]}" | grep -qx "$p"; then echo "$p"; fi
             done | to_json_array | tee /tmp/darwin.json
 
+            # If nothing matched, rebuild all
             if [[ "$(jq 'length' /tmp/linux.json)" == "0" && "$(jq 'length' /tmp/darwin.json)" == "0" ]]; then
               printf '%s\n' "${all_linux[@]}"  | to_json_array > /tmp/linux.json
               printf '%s\n' "${all_darwin[@]}" | to_json_array > /tmp/darwin.json
@@ -123,26 +125,29 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build, push & pin (Linux)
+      - name: Build, push and pin
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
           echo ">>> Building .#$pkg (Linux)"
 
-          # Get every output path (out, man, dev, …)
-          outs=$(nix build --no-link --json ".#$pkg" |
-            jq -r '[.[].outputs | to_entries[] | .value]')
+          # Build and collect all outputs (out, man, dev, etc.) as JSON array
+          outs=$(nix build --no-link --json ".#$pkg" \
+            | jq -r '[.[].outputs | to_entries[] | .value]')
 
-          # Push all outputs to Cachix (deduplicated)
-          echo "$outs" | jq -r '.[]' | sort -u | while read -r path; do
-            echo ">>> Pushing $path"
-            cachix push dmlane "$path"
+          # Safely export multi-line JSON to GITHUB_OUTPUT
+          {
+            echo "outs<<EOF"
+            echo "$outs"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Push and pin every path individually
+          echo "$outs" | jq -r '.[]' | while read -r p; do
+            echo ">>> Pushing & pinning $p"
+            cachix push dmlane "$p"
+            cachix pin dmlane "${pkg}-linux" "$p" --keep-revisions 5
           done
-
-          # Pin all outputs at once; keep only 5 revisions
-          pin_name="${pkg}-linux"
-          echo ">>> Pinning $pin_name"
-          cachix pin dmlane "$pin_name" $(echo "$outs" | jq -r '.[]') --keep-revisions 5
 
   build-darwin:
     needs: plan
@@ -169,21 +174,25 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build, push & pin (macOS)
+      - name: Build, push and pin (macOS)
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
           echo ">>> Building .#$pkg (Darwin)"
 
-          outs=$(nix build --no-link --json ".#$pkg" |
-            jq -r '[.[].outputs | to_entries[] | .value]')
+          # Build and collect all outputs as JSON array
+          outs=$(nix build --no-link --json ".#$pkg" \
+            | jq -r '[.[].outputs | to_entries[] | .value]')
 
-          echo "$outs" | jq -r '.[]' | sort -u | while read -r path; do
-            echo ">>> Pushing $path"
-            cachix push dmlane "$path"
+          {
+            echo "outs<<EOF"
+            echo "$outs"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "$outs" | jq -r '.[]' | while read -r p; do
+            echo ">>> Pushing & pinning $p"
+            cachix push dmlane "$p"
+            cachix pin dmlane "${pkg}-darwin" "$p" --keep-revisions 5
           done
-
-          pin_name="${pkg}-darwin"
-          echo ">>> Pinning $pin_name"
-          cachix pin dmlane "$pin_name" $(echo "$outs" | jq -r '.[]') --keep-revisions 5
 
