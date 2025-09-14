@@ -37,7 +37,8 @@ jobs:
           set -euo pipefail
 
           # Decide diff base (previous commit for push; handles first push too)
-          if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+          if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && \
+                "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
             base="${{ github.event.before }}"
           else
             base="$(git rev-parse HEAD^ || true)"
@@ -97,6 +98,7 @@ jobs:
             fi
           fi
 
+          # Output multi-line JSON arrays safely for GitHub Actions
           {
             echo "packages_linux<<EOF"
             cat /tmp/linux.json
@@ -137,12 +139,12 @@ jobs:
         run: |
           set -euo pipefail
           echo ">>> Building .#${{ matrix.package }} on Linux"
-          cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}"
+          cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}" --out-link ./result
 
       - name: Pin build (keep last 5 versions)
         run: |
           set -euo pipefail
-          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$(realpath result)"
+          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" ./result
 
       - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
@@ -176,14 +178,12 @@ jobs:
         run: |
           set -euo pipefail
           echo ">>> Building .#${{ matrix.package }} on macOS"
-          cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}"
+          cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}" --out-link ./result
 
       - name: Pin build (keep last 5 versions)
         run: |
           set -euo pipefail
-          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" "$(realpath result)"
-
-
+          .github/scripts/pin_keep5.sh dmlane "${{ matrix.package }}" ./result
 
       - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
