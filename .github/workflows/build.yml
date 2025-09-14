@@ -7,7 +7,6 @@ on:
       - 'pkgs/**'
       - 'flake.nix'
       - 'flake.lock'
-      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 concurrency:
@@ -15,9 +14,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Discover "what changed" and map to package names.
   plan:
     runs-on: ubuntu-24.04
+    outputs:
+      packages_linux: ${{ steps.plan.outputs.packages_linux }}
+      packages_darwin: ${{ steps.plan.outputs.packages_darwin }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,105 +30,84 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      # Get changed files (works for push & workflow_dispatch; for PRs add pull_request trigger and base SHA handling)
-      - name: Compute changed files
-        id: changes
+      - name: Compute changed files & package matrix
+        id: plan
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Determine diff base
+          # Decide diff base (previous commit for push; handles first push too)
           if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
             base="${{ github.event.before }}"
           else
-            # Fallback to previous commit on the same branch
             base="$(git rev-parse HEAD^ || true)"
           fi
 
-          if [[ -z "${base}" ]]; then
-            echo "No base commit found; treat as full rebuild."
-            echo "full_rebuild=true" >> "$GITHUB_OUTPUT"
-            echo "changed=" >> "$GITHUB_OUTPUT"
-            exit 0
+          files=""
+          if [[ -n "${base}" ]]; then
+            files="$(git diff --name-only "$base"...HEAD -- \
+              'pkgs/**' 'flake.nix' 'flake.lock' '.github/workflows/build.yml' || true)"
           fi
-
-          files=$(git diff --name-only "$base"...HEAD -- \
-            'pkgs/**' 'flake.nix' 'flake.lock' '.github/workflows/build.yml' || true)
 
           echo "Changed files:"
-          echo "${files}"
+          printf '%s\n' "${files}"
 
-          if echo "${files}" | grep -qE '(^|/)(flake\.nix|flake\.lock)'; then
-            echo "Detected flake file changes → full rebuild."
-            echo "full_rebuild=true" >> "$GITHUB_OUTPUT"
-            echo "changed=${files//$'\n'/,}" >> "$GITHUB_OUTPUT"
-            exit 0
+          full_rebuild=false
+          if [[ -z "${base}" ]] || echo "${files}" | grep -qE '(^|/)(flake\.nix|flake\.lock)'; then
+            full_rebuild=true
           fi
 
-          # If only pkgs/** changed, map to package names.
-          # Conventions supported:
-          #   pkgs/foo.nix            → foo
-          #   pkgs/foo/default.nix    → foo
-          #   pkgs/foo/anything.nix   → foo
-          # If we can’t map, fall back to full rebuild.
-          pkgs=()
+          # Map pkgs/** paths -> package names (dir name or file stem)
+          mapfile -t changed_pkgs < <(
+            awk 'NF' <(printf '%s\n' "${files}") | while read -r f; do
+              case "$f" in
+                pkgs/*.nix)
+                  basename "${f%.nix}"
+                  ;;
+                pkgs/*/*.nix)
+                  basename "$(dirname "$f")"
+                  ;;
+              esac
+            done | awk 'NF && !seen[$0]++'
+          )
 
-          while IFS= read -r f; do
-            [[ -z "$f" ]] && continue
-            case "$f" in
-              pkgs/*.nix)
-                name="$(basename "$f" .nix)"
-                pkgs+=("$name")
-                ;;
-              pkgs/*/*.nix)
-                dir="$(dirname "$f")"
-                name="$(basename "$dir")"
-                pkgs+=("$name")
-                ;;
-            esac
-          done <<< "${files}"
+          # All package names per system (used for verification and full rebuild)
+          mapfile -t all_linux   < <(nix eval --json .#packages.x86_64-linux    | jq -r 'keys[]' | grep -v '^default$' || true)
+          mapfile -t all_darwin  < <(nix eval --json .#packages.aarch64-darwin  | jq -r 'keys[]' | grep -v '^default$' || true)
 
-          # Dedup
-          readarray -t uniq_pkgs < <(printf '%s\n' "${pkgs[@]}" | awk 'NF && !x[$0]++')
+          to_json_array() { jq -R . | jq -s .; }
 
-          if [[ "${#uniq_pkgs[@]}" -eq 0 ]]; then
-            echo "Could not map changes to specific packages → full rebuild."
-            echo "full_rebuild=true" >> "$GITHUB_OUTPUT"
-            echo "changed=${files//$'\n'/,}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          if $full_rebuild; then
+            printf '%s\n' "${all_linux[@]}"  | to_json_array | tee /tmp/linux.json
+            printf '%s\n' "${all_darwin[@]}" | to_json_array | tee /tmp/darwin.json
+          else
+            # Verify changed pkgs exist per system
+            printf '%s\n' "${changed_pkgs[@]}" | awk 'NF' | while read -r p; do
+              if printf '%s\n' "${all_linux[@]}"  | grep -qx "$p"; then echo "$p"; fi
+            done | to_json_array | tee /tmp/linux.json
 
-          # Verify the packages exist in the flake outputs. If verification fails, full rebuild.
-          all_pkgs_json="$(nix eval --json .#packages.x86_64-linux | jq -r 'keys[]')"
-          verified=()
-          for p in "${uniq_pkgs[@]}"; do
-            if echo "${all_pkgs_json}" | grep -qx "$p"; then
-              verified+=("$p")
-            else
-              echo "Warning: '$p' not in flake outputs; will trigger full rebuild."
-              echo "full_rebuild=true" >> "$GITHUB_OUTPUT"
-              echo "changed=${files//$'\n'/,}" >> "$GITHUB_OUTPUT"
-              exit 0
+            printf '%s\n' "${changed_pkgs[@]}" | awk 'NF' | while read -r p; do
+              if printf '%s\n' "${all_darwin[@]}" | grep -qx "$p"; then echo "$p"; fi
+            done | to_json_array | tee /tmp/darwin.json
+
+            # If neither side has anything (e.g. new attr name mismatch), fall back to full rebuild
+            if [[ "$(jq 'length' /tmp/linux.json)" == "0" && "$(jq 'length' /tmp/darwin.json)" == "0" ]]; then
+              printf '%s\n' "${all_linux[@]}"  | to_json_array > /tmp/linux.json
+              printf '%s\n' "${all_darwin[@]}" | to_json_array > /tmp/darwin.json
             fi
-          done
+          fi
 
-          # Build JSON array
-          json=$(printf '%s\n' "${verified[@]}" | jq -R . | jq -s .)
-          echo "Selected packages: ${json}"
-          echo "full_rebuild=false" >> "$GITHUB_OUTPUT"
-          echo "packages=${json}" >> "$GITHUB_OUTPUT"
+          echo "packages_linux=$(cat /tmp/linux.json)"   >> "$GITHUB_OUTPUT"
+          echo "packages_darwin=$(cat /tmp/darwin.json)" >> "$GITHUB_OUTPUT"
 
-    outputs:
-      full_rebuild: ${{ steps.changes.outputs.full_rebuild }}
-      packages: ${{ steps.changes.outputs.packages }}
-
-  # If flake changed (or mapping failed), build ALL packages (minus "default").
-  build-all:
+  build-linux:
     needs: plan
-    if: needs.plan.outputs.full_rebuild == 'true'
+    if: ${{ needs.plan.outputs.packages_linux != '[]' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04]
+        package: ${{ fromJson(needs.plan.outputs.packages_linux) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -144,56 +124,47 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Resolve all package names
-        id: list
+      - name: Build & push (Linux)
         run: |
           set -euo pipefail
-          # Use Linux just to enumerate names
-          pkgs_json=$(nix eval --json .#packages.x86_64-linux | jq -c 'keys | map(select(. != "default"))')
-          echo "pkgs=$pkgs_json" >> "$GITHUB_OUTPUT"
-
-      - name: Build & push all (matrix)
-        run: |
-          set -euo pipefail
-          for pkg in $(echo '${{ steps.list.outputs.pkgs }}' | jq -r '.[]'); do
-            echo ">>> Building .#$pkg on ${{ matrix.os }}"
-            cachix watch-exec dmlane -- nix build -L ".#$pkg"
-          done
-
-  # If only some pkgs changed, build just those.
-  build-some:
-    needs: plan
-    if: needs.plan.outputs.full_rebuild != 'true' && needs.plan.outputs.packages != '[]' && needs.plan.outputs.packages != ''
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-latest]
-        package: ${{ fromJson(needs.plan.outputs.packages) }}
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@v30
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-
-      - name: Configure Cachix
-        uses: cachix/cachix-action@v15
-        with:
-          name: dmlane
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-
-      - name: Build & push (changed package)
-        run: |
-          set -euo pipefail
-          echo ">>> Building .#${{ matrix.package }} on ${{ matrix.os }}"
+          echo ">>> Building .#${{ matrix.package }} on Linux"
           cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}"
 
-      # Optional sanity check for ffmpeg-with-vmaf
-      - name: Verify VMAF filter
+      - name: Verify VMAF for ffmpeg
         if: matrix.package == 'ffmpeg-with-vmaf'
+        run: ./result/bin/ffmpeg -hide_banner -filters | grep -i vmaf
+
+  build-darwin:
+    needs: plan
+    if: ${{ needs.plan.outputs.packages_darwin != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+        package: ${{ fromJson(needs.plan.outputs.packages_darwin) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: dmlane
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build & push (Darwin)
         run: |
-          ./result/bin/ffmpeg -hide_banner -filters | grep -i vmaf
+          set -euo pipefail
+          echo ">>> Building .#${{ matrix.package }} on macOS"
+          cachix watch-exec dmlane -- nix build -L ".#${{ matrix.package }}"
+
+      - name: Verify VMAF for ffmpeg
+        if: matrix.package == 'ffmpeg-with-vmaf'
+        run: ./result/bin/ffmpeg -hide_banner -filters | grep -i vmaf
 
