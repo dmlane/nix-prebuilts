@@ -14,7 +14,6 @@ permissions:
   contents: write
 
 jobs:
-  #
   plan:
     runs-on: ubuntu-latest
     outputs:
@@ -126,28 +125,20 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build, push and pin
+      - name: Build, push & pin (Linux)
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
           echo ">>> Building .#$pkg (Linux)"
 
-          # Build and collect all outputs (out, man, dev, etc.) as JSON array
-          outs=$(nix build --no-link --json ".#$pkg" \
-            | jq -r '[.[].outputs | to_entries[] | .value]')
-
-          # Safely export multi-line JSON to GITHUB_OUTPUT
-          {
-            echo "outs<<EOF"
-            echo "$outs"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-          # Push and pin every path individually
-          echo "$outs" | jq -r '.[]' | while read -r p; do
-            echo ">>> Pushing & pinning $p"
-            cachix push dmlane "$p"
-            cachix pin dmlane "${pkg}-linux" "$p" --keep-revisions 5
+          # Build and pin each output (out, bin, lib, man, etc.)
+          nix build --no-link --json ".#$pkg" |
+            jq -r '.[].outputs | to_entries[] | "\(.key)=\(.value)"' |
+          while IFS='=' read -r name path; do
+            pin_name="${pkg}-linux-${name}"
+            echo ">>> Pushing & pinning $pin_name -> $path"
+            cachix push dmlane "$path"
+            cachix pin dmlane "$pin_name" "$path" --keep-revisions 5
           done
 
   build-darwin:
@@ -175,25 +166,18 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build, push and pin (macOS)
+      - name: Build, push & pin (Darwin)
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
           echo ">>> Building .#$pkg (Darwin)"
 
-          # Build and collect all outputs as JSON array
-          outs=$(nix build --no-link --json ".#$pkg" \
-            | jq -r '[.[].outputs | to_entries[] | .value]')
-
-          {
-            echo "outs<<EOF"
-            echo "$outs"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "$outs" | jq -r '.[]' | while read -r p; do
-            echo ">>> Pushing & pinning $p"
-            cachix push dmlane "$p"
-            cachix pin dmlane "${pkg}-darwin" "$p" --keep-revisions 5
+          nix build --no-link --json ".#$pkg" |
+            jq -r '.[].outputs | to_entries[] | "\(.key)=\(.value)"' |
+          while IFS='=' read -r name path; do
+            pin_name="${pkg}-darwin-${name}"
+            echo ">>> Pushing & pinning $pin_name -> $path"
+            cachix push dmlane "$path"
+            cachix pin dmlane "$pin_name" "$path" --keep-revisions 5
           done
 
