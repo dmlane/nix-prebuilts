@@ -140,7 +140,6 @@ jobs:
           echo "outs<<EOF" >> "$GITHUB_OUTPUT"
           echo "$outs" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-      
           # Push every path in the JSON array to Cachix
           echo "$outs" | jq -r '.[]' | while read -r p; do
             echo ">>> Pushing $p to Cachix"
