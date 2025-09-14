@@ -1,4 +1,4 @@
-name: "Build & Cache all pkgs"
+name: build-cache
 
 on:
   push:
@@ -7,7 +7,6 @@ on:
       - 'pkgs/**'
       - 'flake.nix'
       - 'flake.lock'
-      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 permissions:
@@ -30,62 +29,86 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Detect changed pkgs
+      - name: Compute changed packages
         id: plan
         run: |
           set -euo pipefail
-          base="$(git rev-parse HEAD^ || true)"
-          files="$(git diff --name-only "$base"...HEAD -- pkgs/** flake.nix flake.lock .github/workflows/build.yml || true)"
+
+          # Decide diff base (previous commit or empty for first push)
+          if [[ "${{ github.event_name }}" == "push" && -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            base="${{ github.event.before }}"
+          else
+            base="$(git rev-parse HEAD^ || true)"
+          fi
+
+          files=""
+          if [[ -n "$base" ]]; then
+            files="$(git diff --name-only "$base"...HEAD -- 'pkgs/**' 'flake.nix' 'flake.lock' || true)"
+          fi
+
           echo "Changed files:"
-          echo "$files"
+          printf '%s\n' "${files}"
 
           full_rebuild=false
-          if [[ -z "$base" ]] || echo "$files" | grep -qE 'flake\.(nix|lock)'; then
+          if [[ -z "$base" ]] || echo "$files" | grep -qE '(^|/)(flake\.nix|flake\.lock)'; then
             full_rebuild=true
           fi
 
-          mapfile -t changed < <(
-            echo "$files" | awk 'NF' | while read -r f; do
+          # Map pkgs/** paths -> package names (dir name or file stem)
+          mapfile -t changed_pkgs < <(
+            awk 'NF' <(printf '%s\n' "${files}") | while read -r f; do
               case "$f" in
                 pkgs/*.nix) basename "${f%.nix}" ;;
                 pkgs/*/*.nix) basename "$(dirname "$f")" ;;
               esac
-            done | sort -u
+            done | awk 'NF && !seen[$0]++'
           )
 
+          # All package names for each platform
           mapfile -t all_linux  < <(nix eval --json .#packages.x86_64-linux   | jq -r 'keys[]' | grep -v '^default$' || true)
           mapfile -t all_darwin < <(nix eval --json .#packages.aarch64-darwin | jq -r 'keys[]' | grep -v '^default$' || true)
 
-          to_json() { jq -R . | jq -s .; }
+          to_json_array() { jq -R . | jq -s .; }
 
-          if $full_rebuild || [ ${#changed[@]} -eq 0 ]; then
-            printf '%s\n' "${all_linux[@]}"  | to_json | tee linux.json
-            printf '%s\n' "${all_darwin[@]}" | to_json | tee darwin.json
+          if $full_rebuild; then
+            printf '%s\n' "${all_linux[@]}"  | to_json_array | tee /tmp/linux.json
+            printf '%s\n' "${all_darwin[@]}" | to_json_array | tee /tmp/darwin.json
           else
-            printf '%s\n' "${changed[@]}" | while read -r p; do
+            printf '%s\n' "${changed_pkgs[@]}" | awk 'NF' | while read -r p; do
               if printf '%s\n' "${all_linux[@]}" | grep -qx "$p"; then echo "$p"; fi
-            done | to_json | tee linux.json
+            done | to_json_array | tee /tmp/linux.json
 
-            printf '%s\n' "${changed[@]}" | while read -r p; do
+            printf '%s\n' "${changed_pkgs[@]}" | awk 'NF' | while read -r p; do
               if printf '%s\n' "${all_darwin[@]}" | grep -qx "$p"; then echo "$p"; fi
-            done | to_json | tee darwin.json
+            done | to_json_array | tee /tmp/darwin.json
+
+            # If nothing matched, rebuild all
+            if [[ "$(jq 'length' /tmp/linux.json)" == "0" && "$(jq 'length' /tmp/darwin.json)" == "0" ]]; then
+              printf '%s\n' "${all_linux[@]}"  | to_json_array > /tmp/linux.json
+              printf '%s\n' "${all_darwin[@]}" | to_json_array > /tmp/darwin.json
+            fi
           fi
 
-          echo "packages_linux<<EOF" >> "$GITHUB_OUTPUT"
-          cat linux.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-          echo "packages_darwin<<EOF" >> "$GITHUB_OUTPUT"
-          cat darwin.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "packages_linux<<EOF"
+            cat /tmp/linux.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "packages_darwin<<EOF"
+            cat /tmp/darwin.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
   build-linux:
     needs: plan
     if: ${{ needs.plan.outputs.packages_linux != '[]' }}
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         package: ${{ fromJson(needs.plan.outputs.packages_linux) }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -102,29 +125,32 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Build & push (Linux)
-        id: buildpkg
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
           echo ">>> Building .#$pkg (Linux)"
-          out=$(nix build --no-link --json ".#$pkg" | jq -r '.[].outputs.out')
+          nix build ".#$pkg"
+          out="$(nix path-info ".#$pkg")"
           echo "out=$out" >> "$GITHUB_OUTPUT"
           cachix push dmlane "$out"
 
-      - name: Pin latest build (keep 5)
+      - name: Pin build (keep last 5 versions)
         run: |
+          set -euo pipefail
           pkg="${{ matrix.package }}"
+          out="$(nix path-info ".#$pkg")"
           pin_name="${pkg}-linux"
-          cachix pin dmlane "$pin_name" "${{ steps.buildpkg.outputs.out }}" --keep-revisions 5
+          echo ">>> Pinning $pin_name -> $out"
+          cachix pin dmlane "$pin_name" "$out" --keep-revisions 5
 
   build-darwin:
     needs: plan
     if: ${{ needs.plan.outputs.packages_darwin != '[]' }}
-    runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
         package: ${{ fromJson(needs.plan.outputs.packages_darwin) }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -133,6 +159,8 @@ jobs:
         with:
           extra-conf: |
             experimental-features = nix-command flakes
+          trust-runner-user: true
+          start-daemon: true
 
       - name: Configure Cachix
         uses: cachix/cachix-action@v15
@@ -140,19 +168,22 @@ jobs:
           name: dmlane
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: Build & push (Darwin)
-        id: buildpkg
+      - name: Build & push (macOS)
         run: |
           set -euo pipefail
           pkg="${{ matrix.package }}"
           echo ">>> Building .#$pkg (Darwin)"
-          out=$(nix build --no-link --json ".#$pkg" | jq -r '.[].outputs.out')
+          nix build ".#$pkg"
+          out="$(nix path-info ".#$pkg")"
           echo "out=$out" >> "$GITHUB_OUTPUT"
           cachix push dmlane "$out"
 
-      - name: Pin latest build (keep 5)
+      - name: Pin build (keep last 5 versions)
         run: |
+          set -euo pipefail
           pkg="${{ matrix.package }}"
+          out="$(nix path-info ".#$pkg")"
           pin_name="${pkg}-darwin"
-          cachix pin dmlane "$pin_name" "${{ steps.buildpkg.outputs.out }}" --keep-revisions 5
+          echo ">>> Pinning $pin_name -> $out"
+          cachix pin dmlane "$pin_name" "$out" --keep-revisions 5
 
