@@ -97,8 +97,17 @@ jobs:
             fi
           fi
 
-          echo "packages_linux=$(cat /tmp/linux.json)"   >> "$GITHUB_OUTPUT"
-          echo "packages_darwin=$(cat /tmp/darwin.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "packages_linux<<EOF"
+            cat /tmp/linux.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "packages_darwin<<EOF"
+            cat /tmp/darwin.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
   build-linux:
     needs: plan
